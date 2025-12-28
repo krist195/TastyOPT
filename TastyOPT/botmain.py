@@ -21,17 +21,16 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.dispatcher.event.bases import SkipHandler
 
 # ============ ЛОГИ ============
-
 logging.basicConfig(level=logging.INFO)
 
 # Загружаем .env
 load_dotenv()
 
 # ============ НАСТРОЙКИ ИЗ ENV ============
-
 API_TOKEN = os.getenv("BOT_TOKEN")
 ADMINS_RAW = os.getenv("ADMIN_IDS", "")
 ARCHIVE_CHAT_ID_RAW = os.getenv("ARCHIVE_CHAT_ID", "").strip()
+
 
 def parse_admin_ids(raw: str):
     ids = set()
@@ -44,6 +43,7 @@ def parse_admin_ids(raw: str):
         except ValueError:
             logging.warning(f"Не удалось распарсить ADMIN_ID: {part}")
     return ids
+
 
 ADMIN_IDS = parse_admin_ids(ADMINS_RAW)
 
@@ -64,7 +64,6 @@ if not ADMIN_IDS:
     logging.warning("ADMIN_IDS пуст — в боте не будет админов. Задай ADMIN_IDS в env.")
 
 # ============ ПУТИ К ФАЙЛАМ "БД" ============
-
 DATA_DIR = "data"
 USERS_FILE = os.path.join(DATA_DIR, "users.txt")
 STATS_FILE = os.path.join(DATA_DIR, "stats.txt")
@@ -73,7 +72,6 @@ BROADCASTS_FILE = os.path.join(DATA_DIR, "broadcasts.json")   # список р�
 DELIVERIES_FILE = os.path.join(DATA_DIR, "deliveries.json")   # кто что получил + message_id в личке
 
 # ============ ИНИЦИАЛИЗАЦИЯ БОТА ============
-
 bot = Bot(
     token=API_TOKEN,
     default=DefaultBotProperties(parse_mode="HTML"),
@@ -104,12 +102,14 @@ def _load_json(path: str, default: Any) -> Any:
         logging.warning(f"JSON повреждён: {path}. Создаю заново.")
         return default
 
+
 def _save_json(path: str, data: Any) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
 
 def ensure_files():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -123,7 +123,9 @@ def ensure_files():
     if not os.path.exists(DELIVERIES_FILE):
         _save_json(DELIVERIES_FILE, {"deliveries": {}})
 
+
 ensure_files()
+
 
 def load_broadcasts() -> list[dict[str, Any]]:
     ensure_files()
@@ -133,8 +135,10 @@ def load_broadcasts() -> list[dict[str, Any]]:
         return []
     return items
 
+
 def save_broadcasts(items: list[dict[str, Any]]) -> None:
     _save_json(BROADCASTS_FILE, {"broadcasts": items})
+
 
 def load_deliveries() -> dict[str, dict[str, int]]:
     """
@@ -145,7 +149,6 @@ def load_deliveries() -> dict[str, dict[str, int]]:
     d = data.get("deliveries", {})
     if not isinstance(d, dict):
         return {}
-    # нормализуем вложенность
     cleaned: dict[str, dict[str, int]] = {}
     for uid, mp in d.items():
         if not isinstance(mp, dict):
@@ -158,12 +161,15 @@ def load_deliveries() -> dict[str, dict[str, int]]:
                 continue
     return cleaned
 
+
 def save_deliveries(deliveries: dict[str, dict[str, int]]) -> None:
     _save_json(DELIVERIES_FILE, {"deliveries": deliveries})
+
 
 def was_delivered(user_id: int, broadcast_id: str) -> bool:
     deliveries = load_deliveries()
     return broadcast_id in deliveries.get(str(user_id), {})
+
 
 def mark_delivered(user_id: int, broadcast_id: str, chat_message_id: int) -> None:
     deliveries = load_deliveries()
@@ -171,6 +177,7 @@ def mark_delivered(user_id: int, broadcast_id: str, chat_message_id: int) -> Non
     deliveries.setdefault(uid, {})
     deliveries[uid][broadcast_id] = int(chat_message_id)
     save_deliveries(deliveries)
+
 
 def unmark_broadcast_everywhere(broadcast_id: str) -> None:
     deliveries = load_deliveries()
@@ -184,6 +191,7 @@ def unmark_broadcast_everywhere(broadcast_id: str) -> None:
             changed = True
     if changed:
         save_deliveries(deliveries)
+
 
 def get_user_ids() -> list[int]:
     user_ids: list[int] = []
@@ -205,10 +213,61 @@ def get_user_ids() -> list[int]:
         pass
     return user_ids
 
+
+# =======================================================
+# ✅ ВАЖНОЕ: "СОХРАНИТЬ В ОТКАТЫ БЕЗ ПЕРЕСЛАНО"
+# =======================================================
+async def copy_to_archive(src: types.Message) -> types.Message:
+    """
+    Копируем сообщение в архив (Откаты) через copy_message.
+    Тогда в Откатах и у пользователей НЕ будет строки "Переслано ...".
+    Premium/кастом эмодзи при этом НЕ сохраняются (и это ок по твоему ТЗ сейчас).
+    """
+    if ARCHIVE_CHAT_ID is None:
+        raise RuntimeError("ARCHIVE_CHAT_ID не задан")
+
+    res = await bot.copy_message(
+        chat_id=ARCHIVE_CHAT_ID,
+        from_chat_id=src.chat.id,
+        message_id=src.message_id,
+    )
+
+    mid = getattr(res, "message_id", None)
+    if mid is None:
+        # на всякий случай
+        mid = int(res)
+
+    # Возвращаем "фейковый Message" не надо — нам достаточно message_id,
+    # но типом пусть будет Message для совместимости — сделаем простой объект-обёртку
+    # (в aiogram copy_message возвращает MessageId).
+    dummy = types.Message(message_id=int(mid), date=datetime.now(), chat=types.Chat(id=ARCHIVE_CHAT_ID, type="supergroup"))
+    return dummy
+
+
+async def copy_from_archive_to_chat(chat_id: int, archive_message_id: int) -> int:
+    """
+    Копия из архива в нужный чат (без "Переслано").
+    Возвращает message_id в целевом чате.
+    """
+    if ARCHIVE_CHAT_ID is None:
+        raise RuntimeError("ARCHIVE_CHAT_ID не задан")
+
+    res = await bot.copy_message(
+        chat_id=chat_id,
+        from_chat_id=ARCHIVE_CHAT_ID,
+        message_id=archive_message_id,
+    )
+    mid = getattr(res, "message_id", None)
+    if mid is None:
+        mid = int(res)
+    return int(mid)
+
+
 async def send_missing_broadcasts_to_user(user_id: int) -> None:
     """
     На /start отправляет пользователю все рассылки из архива,
     которых он ещё не получал.
+    Отправка идёт copy_message => нет "переслано".
     """
     if ARCHIVE_CHAT_ID is None:
         return
@@ -217,7 +276,6 @@ async def send_missing_broadcasts_to_user(user_id: int) -> None:
     if not broadcasts:
         return
 
-    # сортировка по времени создания (если нет — по message_id)
     def _key(b: dict[str, Any]):
         return (b.get("created_at", ""), int(b.get("archive_message_id", 0)))
 
@@ -233,17 +291,12 @@ async def send_missing_broadcasts_to_user(user_id: int) -> None:
             continue
 
         try:
-            msg = await bot.forward_message(
-                chat_id=user_id,
-                from_chat_id=ARCHIVE_CHAT_ID,
-                message_id=archive_mid,
-            )
-            mark_delivered(user_id, bid, msg.message_id)
-            # лёгкая пауза (на случай если много архивных сообщений)
+            new_mid = await copy_from_archive_to_chat(user_id, archive_mid)
+            mark_delivered(user_id, bid, new_mid)
             await asyncio.sleep(0.05)
         except Exception:
-            # пользователь мог заблокировать бота / нет диалога и т.д.
             break
+
 
 async def delete_broadcast_everywhere(broadcast_id: str) -> tuple[int, int]:
     """
@@ -278,7 +331,6 @@ async def delete_broadcast_everywhere(broadcast_id: str) -> tuple[int, int]:
     try:
         await bot.delete_message(chat_id=ARCHIVE_CHAT_ID, message_id=int(broadcast_id))
     except Exception:
-        # архив мог не удалиться (нет прав/уже удалено)
         pass
 
     # 3) убрать из deliveries.json
@@ -291,10 +343,10 @@ async def delete_broadcast_everywhere(broadcast_id: str) -> tuple[int, int]:
 
     return ok, fail
 
+
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
 def save_user(user: types.User):
-    """Сохранить пользователя, который нажал /start, в красивом виде."""
     ensure_files()
 
     STANDARD_HEADER = "user_id | Full_name | @username | first_seen_at"
@@ -331,11 +383,12 @@ def save_user(user: types.User):
         with open(USERS_FILE, "a", encoding="utf-8") as f:
             f.write(f"{uid} | {full_name} | {username} | {first_seen}\n")
 
+
 def log_action(user: types.User, action: str):
-    """Логируем любое действие пользователя."""
     ensure_files()
     with open(STATS_FILE, "a", encoding="utf-8") as f:
         f.write(f"{datetime.now().isoformat()};{user.id};{user.username or ''};{action}\n")
+
 
 async def cleanup_user_messages(chat_id: int, user_id: int):
     """
@@ -357,9 +410,10 @@ async def cleanup_user_messages(chat_id: int, user_id: int):
     if greet_id is not None:
         user_messages[user_id].add(greet_id)
 
+
 def remember_bot_message(user_id: int, message_id: int):
-    """Запоминаем id сообщения бота, чтобы потом можно было удалить."""
     user_messages.setdefault(user_id, set()).add(message_id)
+
 
 def get_main_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
     keyboard: list[list[KeyboardButton]] = []
@@ -388,7 +442,7 @@ def get_main_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
 
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
-# Человекочитаемые названия для действий в статистике
+
 ACTION_LABELS = {
     "start": "▶️ Старт бота (/start)",
     "button_stock": "📦 Наличие стока (кнопка)",
@@ -407,6 +461,7 @@ ACTION_LABELS = {
     "admin_broadcast_cancel": "👑 Админ: отмена рассылки",
     "admin_stats_button": "👑 Админ: просмотр статистики",
 }
+
 
 def load_stats_summary():
     total_users = 0
@@ -440,8 +495,8 @@ def load_stats_summary():
     total_start = button_counts.get("start", 0)
     return total_users, total_start, button_counts
 
-# ============ ТЕКСТЫ ДЛЯ ℹ️ ИНФОРМАЦИЯ ДЛЯ ЗАКАЗА ============
 
+# ============ ТЕКСТЫ ДЛЯ ℹ️ ИНФОРМАЦИЯ ДЛЯ ЗАКАЗА ============
 INFO_1_TEXT = (
     "<b>Формирование заказа</b> 🧾\n\n"
     "Вы отправляете список нужных вкусов и позиций из актуального наличия Tasty Shop.\n\n"
@@ -449,8 +504,7 @@ INFO_1_TEXT = (
     "<b>Максимальный заказ:</b> до 1000 единиц (больше — по согласованию)\n\n"
     "<b>Стоимость</b> зависит от объёма.\n"
     "Постоянным и крупным клиентам предоставляются <b>индивидуальные скидки</b>\n\n"
-    "Вы можете свободно комбинировать любые позиции и вкусы — список формируется "
-    "полностью под ваши задачи."
+    "Вы можете свободно комбинировать любые позиции и вкусы — список формируется полностью под ваши задачи."
 )
 
 INFO_2_TEXT = (
@@ -502,6 +556,7 @@ INFO_5_TEXT = (
     "Сроки могут незначительно отличаться в зависимости от региона и загрузки служб доставки."
 )
 
+
 def get_info_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -512,6 +567,7 @@ def get_info_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🚚 Сроки доставки", callback_data="info_5")],
         ]
     )
+
 
 # ============ КОМАНДЫ ============
 
@@ -548,8 +604,9 @@ async def cmd_start(message: types.Message):
     greeting_messages[user.id] = msg.message_id
     remember_bot_message(user.id, msg.message_id)
 
-    # ✅ Умная рассылка новым: отправляем всё из архива, чего ещё не получал
+    # ✅ Умная рассылка новым: отправляем ВСЕ прошлые, которых ещё не получал
     await send_missing_broadcasts_to_user(user.id)
+
 
 @dp.message(Command("myid"))
 async def cmd_myid(message: types.Message):
@@ -563,9 +620,11 @@ async def cmd_myid(message: types.Message):
         "и перезапусти бота."
     )
 
+
 @dp.message(Command("chatid"))
 async def cmd_chatid(message: types.Message):
     await message.answer(f"chat_id: <code>{message.chat.id}</code>")
+
 
 # ============ ОБРАБОТЧИКИ КНОПОК ПОЛЬЗОВАТЕЛЯ ============
 
@@ -601,6 +660,7 @@ async def handle_stock(message: types.Message):
     msg = await message.answer(text, reply_markup=kb)
     remember_bot_message(user.id, msg.message_id)
 
+
 @dp.message(F.text == "👨‍💻Связь с менеджером")
 async def handle_manager(message: types.Message):
     user = message.from_user
@@ -627,6 +687,7 @@ async def handle_manager(message: types.Message):
 
     msg = await message.answer(text, reply_markup=kb)
     remember_bot_message(user.id, msg.message_id)
+
 
 @dp.message(F.text == "📣 ИНФОРМАЦИОННЫЙ КАНАЛ")
 async def handle_channel(message: types.Message):
@@ -655,6 +716,7 @@ async def handle_channel(message: types.Message):
     msg = await message.answer(text, reply_markup=kb)
     remember_bot_message(user.id, msg.message_id)
 
+
 @dp.message(F.text == "🔥 Отзывы")
 async def handle_reviews(message: types.Message):
     user = message.from_user
@@ -682,6 +744,7 @@ async def handle_reviews(message: types.Message):
     msg = await message.answer(text, reply_markup=kb)
     remember_bot_message(user.id, msg.message_id)
 
+
 @dp.message(F.text == "ℹ️ ИНФОРМАЦИЯ ДЛЯ ЗАКАЗА")
 async def handle_order_info(message: types.Message):
     user = message.from_user
@@ -705,7 +768,6 @@ async def handle_order_info(message: types.Message):
     msg = await message.answer(text, reply_markup=kb)
     remember_bot_message(user.id, msg.message_id)
 
-# ============ CALLBACK ДЛЯ 5 ПУНКТОВ ИНФОРМАЦИИ ============
 
 @dp.callback_query(F.data.startswith("info_"))
 async def process_info_callback(callback: types.CallbackQuery):
@@ -740,6 +802,7 @@ async def process_info_callback(callback: types.CallbackQuery):
 
     await callback.answer()
 
+
 # ============ АДМИН: РАССЫЛКА (МЕНЮ) ============
 
 def get_broadcast_menu_kb() -> InlineKeyboardMarkup:
@@ -750,12 +813,14 @@ def get_broadcast_menu_kb() -> InlineKeyboardMarkup:
         ]
     )
 
+
 def get_broadcast_cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel_mode")]
         ]
     )
+
 
 @dp.message(F.text.contains("Рассылка"))
 async def admin_broadcast_command(message: types.Message):
@@ -782,22 +847,20 @@ async def admin_broadcast_command(message: types.Message):
     if ARCHIVE_CHAT_ID is None:
         msg = await message.answer(
             "⚠️ <b>ARCHIVE_CHAT_ID не настроен.</b>\n\n"
-            "Добавь бота в группу-архив и укажи её ID в .env:\n"
+            "Укажи ID архива в .env:\n"
             "<code>ARCHIVE_CHAT_ID=-100...</code>\n\n"
-            "Чтобы узнать ID группы — напиши в ней /chatid."
+            "Чтобы узнать ID — напиши /chatid в архиве."
         )
         remember_bot_message(user.id, msg.message_id)
         return
 
     text = (
         "📨 <b>Умная рассылка</b>\n\n"
-        "• Рассылка идёт <b>пересылкой</b> (forward)\n"
-        "• Каждая рассылка сохраняется в <b>архив-группе</b>\n"
-        "• Новые пользователи на /start получают <b>все прошлые рассылки</b>, которых ещё не получали\n"
-        "• Можно <b>удалить рассылку</b> — она удалится у всех пользователей\n"
+        "Выберите действие ниже 👇"
     )
     msg = await message.answer(text, reply_markup=get_broadcast_menu_kb())
     remember_bot_message(user.id, msg.message_id)
+
 
 @dp.callback_query(F.data == "broadcast_menu_new")
 async def broadcast_menu_new(callback: types.CallbackQuery):
@@ -809,17 +872,18 @@ async def broadcast_menu_new(callback: types.CallbackQuery):
     pending_broadcast_admins.add(admin.id)
     broadcast_drafts.pop(admin.id, None)
 
+    await cleanup_user_messages(callback.message.chat.id, admin.id)
+
     text = (
         "➕ <b>Новая рассылка</b>\n\n"
-        "Отправь <b>одно сообщение</b> (текст/фото/видео и т.д.), которое нужно разослать.\n\n"
-        "Я сначала <b>перешлю его в архив-группу</b>, потом покажу предпросмотр и спрошу подтверждение."
+        "Отправь <b>одно сообщение</b>, которое нужно разослать.\n"
+        "Я сохраню его в Откаты и покажу предпросмотр."
     )
-    try:
-        await callback.message.edit_text(text, reply_markup=get_broadcast_cancel_kb())
-    except Exception:
-        await callback.message.answer(text, reply_markup=get_broadcast_cancel_kb())
+    msg = await bot.send_message(chat_id=callback.message.chat.id, text=text, reply_markup=get_broadcast_cancel_kb())
+    remember_bot_message(admin.id, msg.message_id)
 
     await callback.answer()
+
 
 @dp.callback_query(F.data == "broadcast_cancel_mode")
 async def broadcast_cancel_mode(callback: types.CallbackQuery):
@@ -838,15 +902,14 @@ async def broadcast_cancel_mode(callback: types.CallbackQuery):
         except Exception:
             pass
 
-    try:
-        await callback.message.edit_text("❌ Отменено.")
-    except Exception:
-        pass
+    await cleanup_user_messages(callback.message.chat.id, admin.id)
+    msg = await bot.send_message(chat_id=callback.message.chat.id, text="❌ Отменено.")
+    remember_bot_message(admin.id, msg.message_id)
 
     await callback.answer()
 
-# ============ АДМИН: ПОЛУЧЕНИЕ СООБЩЕНИЯ ДЛЯ РАССЫЛКИ ============
 
+# ============ АДМИН: ПОЛУЧЕНИЕ СООБЩЕНИЯ ДЛЯ РАССЫЛКИ ============
 @dp.message()
 async def admin_broadcast_prepare(message: types.Message):
     user = message.from_user
@@ -864,26 +927,21 @@ async def admin_broadcast_prepare(message: types.Message):
     pending_broadcast_admins.discard(user.id)
     log_action(user, "admin_broadcast_prepare")
 
-    # 1) сохраняем в архив пересылкой (важно для premium emoji)
+    # 1) сохраняем в Откаты копией (без "переслано")
     try:
-        archive_msg = await bot.forward_message(
-            chat_id=ARCHIVE_CHAT_ID,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-        )
+        archive_msg = await copy_to_archive(message)
     except Exception as e:
-        await message.answer(f"❌ Не удалось переслать в архив-группу: {e}")
+        await message.answer(f"❌ Не удалось сохранить в Откаты: {e}")
         return
 
     broadcast_drafts[user.id] = {"archive_message_id": archive_msg.message_id}
 
-    # 2) предпросмотр админа: пересылаем из архива ему же
+    await cleanup_user_messages(message.chat.id, user.id)
+
+    # 2) предпросмотр админа: копия из Откатов (так же, как будет у пользователей)
     try:
-        await bot.forward_message(
-            chat_id=message.chat.id,
-            from_chat_id=ARCHIVE_CHAT_ID,
-            message_id=archive_msg.message_id,
-        )
+        prev_mid = await copy_from_archive_to_chat(message.chat.id, archive_msg.message_id)
+        remember_bot_message(user.id, prev_mid)
     except Exception:
         pass
 
@@ -898,14 +956,14 @@ async def admin_broadcast_prepare(message: types.Message):
 
     text = (
         "👀 <b>Предпросмотр</b>\n\n"
-        "Это сообщение будет разослано <b>пересылкой</b>.\n"
+        "Это сообщение будет разослано <b>без «Переслано...»</b>.\n"
         "Продолжить?"
     )
     preview_msg = await message.answer(text, reply_markup=kb)
     remember_bot_message(user.id, preview_msg.message_id)
 
-# ============ АДМИН: ОТПРАВИТЬ / ОТМЕНА ============
 
+# ============ АДМИН: ОТПРАВИТЬ / ОТМЕНА ============
 @dp.callback_query(F.data.in_({"broadcast_send", "broadcast_cancel"}))
 async def process_broadcast_action(callback: types.CallbackQuery):
     admin = callback.from_user
@@ -931,17 +989,14 @@ async def process_broadcast_action(callback: types.CallbackQuery):
             except Exception:
                 pass
 
-        try:
-            await callback.message.edit_text("❌ Рассылка отменена (и удалена из архива).")
-        except Exception:
-            pass
+        await cleanup_user_messages(callback.message.chat.id, admin.id)
+        msg = await bot.send_message(chat_id=callback.message.chat.id, text="❌ Рассылка отменена (и удалена из Откатов).")
+        remember_bot_message(admin.id, msg.message_id)
 
         await callback.answer("Отменено.")
         return
 
-    # SEND
     await callback.answer("Запускаю рассылку...")
-
     log_action(admin, "admin_broadcast_start")
 
     # добавляем рассылку в список (архив) — чтобы новым юзерам приходила
@@ -949,7 +1004,7 @@ async def process_broadcast_action(callback: types.CallbackQuery):
     if not any(str(b.get("archive_message_id")) == broadcast_id for b in broadcasts):
         broadcasts.append(
             {
-                "archive_message_id": archive_mid,
+                "archive_message_id": int(archive_mid),
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "created_by": admin.id,
             }
@@ -960,19 +1015,15 @@ async def process_broadcast_action(callback: types.CallbackQuery):
 
     success = 0
     failed = 0
-
     ops = 0
+
     for uid in user_ids:
         # не шлём повторно тем, кто уже получал
         if was_delivered(uid, broadcast_id):
             continue
         try:
-            msg = await bot.forward_message(
-                chat_id=uid,
-                from_chat_id=ARCHIVE_CHAT_ID,
-                message_id=archive_mid,
-            )
-            mark_delivered(uid, broadcast_id, msg.message_id)
+            new_mid = await copy_from_archive_to_chat(uid, archive_mid)
+            mark_delivered(uid, broadcast_id, new_mid)
             success += 1
         except Exception:
             failed += 1
@@ -983,6 +1034,8 @@ async def process_broadcast_action(callback: types.CallbackQuery):
 
     broadcast_drafts.pop(admin.id, None)
 
+    await cleanup_user_messages(callback.message.chat.id, admin.id)
+
     text = (
         "✅ <b>Рассылка завершена</b>\n\n"
         f"📬 Успешно доставлено: <b>{success}</b>\n"
@@ -990,13 +1043,10 @@ async def process_broadcast_action(callback: types.CallbackQuery):
         f"🗂 ID рассылки (для удаления): <code>{broadcast_id}</code>"
     )
 
-    try:
-        msg = await callback.message.edit_text(text)
-    except Exception:
-        msg = await callback.message.answer(text)
-
+    msg = await bot.send_message(chat_id=callback.message.chat.id, text=text)
     remember_bot_message(admin.id, msg.message_id)
     log_action(admin, f"admin_broadcast_done_success_{success}_failed_{failed}")
+
 
 # ============ АДМИН: УДАЛЕНИЕ РАССЫЛКИ ============
 
@@ -1008,11 +1058,15 @@ async def broadcast_menu_delete(callback: types.CallbackQuery):
         return
 
     broadcasts = load_broadcasts()
+    await cleanup_user_messages(callback.message.chat.id, admin.id)
+
     if not broadcasts:
-        try:
-            await callback.message.edit_text("🗑 <b>Удаление рассылки</b>\n\nАрхив пуст.", reply_markup=get_broadcast_menu_kb())
-        except Exception:
-            await callback.message.answer("Архив пуст.", reply_markup=get_broadcast_menu_kb())
+        msg = await bot.send_message(
+            chat_id=callback.message.chat.id,
+            text="🗑 <b>Удаление рассылки</b>\n\nАрхив пуст.",
+            reply_markup=get_broadcast_menu_kb()
+        )
+        remember_bot_message(admin.id, msg.message_id)
         await callback.answer()
         return
 
@@ -1033,20 +1087,18 @@ async def broadcast_menu_delete(callback: types.CallbackQuery):
         kb_rows.append([InlineKeyboardButton(text=label, callback_data=f"broadcast_delete_pick:{mid}")])
 
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="broadcast_back_to_menu")])
-
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
     text = (
         "🗑 <b>Удаление рассылки</b>\n\n"
-        "Выбери рассылку — бот удалит её <b>у всех пользователей</b> и из архива."
+        "Выбери рассылку — бот покажет предпросмотр (сверху) и попросит подтверждение (снизу)."
     )
 
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb)
+    msg = await bot.send_message(chat_id=callback.message.chat.id, text=text, reply_markup=kb)
+    remember_bot_message(admin.id, msg.message_id)
 
     await callback.answer()
+
 
 @dp.callback_query(F.data == "broadcast_back_to_menu")
 async def broadcast_back_to_menu(callback: types.CallbackQuery):
@@ -1054,11 +1106,18 @@ async def broadcast_back_to_menu(callback: types.CallbackQuery):
     if admin is None or admin.id not in ADMIN_IDS:
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
-    try:
-        await callback.message.edit_text("📨 <b>Умная рассылка</b>", reply_markup=get_broadcast_menu_kb())
-    except Exception:
-        await callback.message.answer("📨 <b>Умная рассылка</b>", reply_markup=get_broadcast_menu_kb())
+
+    await cleanup_user_messages(callback.message.chat.id, admin.id)
+
+    msg = await bot.send_message(
+        chat_id=callback.message.chat.id,
+        text="📨 <b>Умная рассылка</b>",
+        reply_markup=get_broadcast_menu_kb()
+    )
+    remember_bot_message(admin.id, msg.message_id)
+
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("broadcast_delete_pick:"))
 async def broadcast_delete_pick(callback: types.CallbackQuery):
@@ -1067,7 +1126,19 @@ async def broadcast_delete_pick(callback: types.CallbackQuery):
         await callback.answer("Недостаточно прав.", show_alert=True)
         return
 
+    if ARCHIVE_CHAT_ID is None:
+        await callback.answer("ARCHIVE_CHAT_ID не настроен.", show_alert=True)
+        return
+
     _, bid = callback.data.split(":", 1)
+    await cleanup_user_messages(callback.message.chat.id, admin.id)
+
+    # предпросмотр сверху: копия из откатов (без "переслано")
+    try:
+        prev_mid = await copy_from_archive_to_chat(callback.message.chat.id, int(bid))
+        remember_bot_message(admin.id, prev_mid)
+    except Exception:
+        pass
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1081,17 +1152,17 @@ async def broadcast_delete_pick(callback: types.CallbackQuery):
     text = (
         f"⚠️ <b>Подтверждение удаления</b>\n\n"
         f"Удалить рассылку ID <code>{bid}</code>:\n"
-        "• из архива\n"
-        "• и <b>у всех пользователей</b> (сообщение исчезнет из их чатов)\n\n"
+        "• из Откатов\n"
+        "• и <b>у всех пользователей</b>\n\n"
+        "Сообщение выше — это то, что будет удалено.\n"
         "Продолжить?"
     )
 
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await callback.message.answer(text, reply_markup=kb)
+    msg = await bot.send_message(chat_id=callback.message.chat.id, text=text, reply_markup=kb)
+    remember_bot_message(admin.id, msg.message_id)
 
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("broadcast_delete_confirm:"))
 async def broadcast_delete_confirm(callback: types.CallbackQuery):
@@ -1106,19 +1177,24 @@ async def broadcast_delete_confirm(callback: types.CallbackQuery):
 
     ok, fail = await delete_broadcast_everywhere(bid)
 
+    await cleanup_user_messages(callback.message.chat.id, admin.id)
+
     text = (
         "🗑 <b>Удаление завершено</b>\n\n"
         f"✅ Удалено у пользователей: <b>{ok}</b>\n"
         f"⚠️ Ошибок при удалении: <b>{fail}</b>\n\n"
-        "Если нужно — создай новую рассылку заново."
+        "Следов в базе больше нет."
     )
 
-    try:
-        await callback.message.edit_text(text, reply_markup=get_broadcast_menu_kb())
-    except Exception:
-        await callback.message.answer(text, reply_markup=get_broadcast_menu_kb())
+    msg = await bot.send_message(
+        chat_id=callback.message.chat.id,
+        text=text,
+        reply_markup=get_broadcast_menu_kb()
+    )
+    remember_bot_message(admin.id, msg.message_id)
 
-# ============ АДМИН: СТАТИСТИКА + TXT ПОЛЬЗОВАТЕЛЕЙ ============
+
+# ============ АДМИН: СТАТИСТИКА ============
 
 @dp.message(F.text.contains("Статистика"))
 async def admin_stats(message: types.Message):
@@ -1162,10 +1238,7 @@ async def admin_stats(message: types.Message):
         if key.startswith("admin_broadcast_done_success_"):
             label = "👑 Админ: рассылка завершена"
         else:
-            label = ACTION_LABELS.get(key)
-            if label is None:
-                label = f"🔧 Служебное событие: {key}"
-
+            label = ACTION_LABELS.get(key) or f"🔧 Служебное событие: {key}"
         display_counts[label] = display_counts.get(label, 0) + val
 
     for label, val in sorted(display_counts.items(), key=lambda x: x[0]):
@@ -1174,6 +1247,7 @@ async def admin_stats(message: types.Message):
     msg = await message.answer("\n".join(text_lines))
     remember_bot_message(user.id, msg.message_id)
 
+    # users.txt документ
     try:
         if os.path.exists(USERS_FILE) and os.path.getsize(USERS_FILE) > 0:
             doc = FSInputFile(USERS_FILE)
@@ -1190,11 +1264,12 @@ async def admin_stats(message: types.Message):
         err_msg = await message.answer("Ошибка при отправке файла <code>users.txt</code>.")
         remember_bot_message(user.id, err_msg.message_id)
 
-# ============ ЗАПУСК БОТА ============
 
+# ============ ЗАПУСК БОТА ============
 async def main():
     print("Bot started...")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

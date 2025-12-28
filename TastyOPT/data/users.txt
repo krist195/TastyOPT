@@ -1,2 +1,5 @@
 user_id | Full_name | @username | first_seen_at
 426549106 | hrts890 | @hrts890 | 2025-11-25 00:44:09
+966939413 | sryided | @k1ll0ut | 2025-12-28 22:00:34
+6987058119 | VapeW$st | @Vape_Westt | 2025-12-28 22:10:10
+8128070571 | RIGA Manager | @rigamanager | 2025-12-28 23:12:56
