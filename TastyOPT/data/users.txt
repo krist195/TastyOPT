@@ -1,0 +1,2 @@
+user_id | Full_name | @username | first_seen_at
+426549106 | hrts890 | @hrts890 | 2025-11-25 00:44:09

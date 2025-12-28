@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  tasty-bot:
+    build: .
+    container_name: tastyshop_opt_bot
+    restart: unless-stopped
+
+    # Подтягиваем переменные окружения из .env
+    env_file:
+      - .env
+
+    # Сохраняем data снаружи контейнера
+    volumes:
+      - ./data:/app/data
